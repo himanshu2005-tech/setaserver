@@ -1,2 +1,12 @@
+# ignore environment variables
 .env
+*.env
+
+# ignore node modules
 node_modules/
+
+# ignore service account JSON
+*.json
+
+# OS files
+.DS_Store
