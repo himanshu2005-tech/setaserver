@@ -35,7 +35,6 @@ initializeApp({
   credential: cert(serviceAccount)
 });
 
-
 const db = getFirestore();
 
 // --- Middleware ---
@@ -56,6 +55,35 @@ const validatePath = (req, res, next) => {
 };
 
 // --- Helpers ---
+
+/**
+ * Authorization Logic:
+ * 1. If dataset does not exist -> Deny.
+ * 2. If visibility is 'Public' -> Allow.
+ * 3. If visibility is 'Private' -> Check if userId is in 'access_users'.
+ */
+function checkDatasetAccess(datasetDoc, userId) {
+  if (!datasetDoc.exists) return false;
+  
+  const data = datasetDoc.data();
+
+  // 1. Allow if explicitly Public
+  if (data.visibility === "Public" || data.isPublic === true) {
+    return true;
+  }
+
+  // 2. Check Private Access via access_users array
+  // We check this regardless of whether visibility is explicitly set to 'Private' 
+  // to catch cases where visibility might be undefined but access_users exists.
+  if (data.access_users && Array.isArray(data.access_users)) {
+    if (data.access_users.includes(userId)) {
+      return true;
+    }
+  }
+
+  // 3. Fallback / Default Deny
+  return false;
+}
 
 async function updateRequestCount(userId, datasetId, version) {
   try {
@@ -114,14 +142,6 @@ async function updateRequestCount(userId, datasetId, version) {
   }
 }
 
-function checkDatasetAccess(datasetDoc, userId) {
-  if (!datasetDoc.exists) return false;
-  const data = datasetDoc.data();
-  if (data.visibility === "Public" || data.isPublic) return true; 
-  if (!data.access_users || !Array.isArray(data.access_users)) return false;
-  return data.access_users.includes(userId);
-}
-
 // --- API Endpoints ---
 
 /**
@@ -137,7 +157,10 @@ app.get('/getRecentSeta', async (req, res) => {
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
+    // STRICT AUTH CHECK
+    if (!checkDatasetAccess(datasetDoc, userId)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
 
     // 2. Find Latest Enabled Version
     const versionsRef = datasetRef.collection("versions");
@@ -159,7 +182,7 @@ app.get('/getRecentSeta', async (req, res) => {
     // 3. Update Stats
     updateRequestCount(userId, id, versionId).catch(err => console.error("Stat update failed", err));
 
-    // 4. Return Data (UPDATED: Sending 'files' array)
+    // 4. Return Data
     res.status(200).json({ 
       version: versionId,
       publishedOn: latestVersionData.publishedOn,
@@ -185,7 +208,10 @@ app.get('/getSetaByVersion', async (req, res) => {
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
+    // STRICT AUTH CHECK
+    if (!checkDatasetAccess(datasetDoc, userId)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
 
     const docRef = db.collection('datasets').doc(id).collection('versions').doc(version);
     const doc = await docRef.get();
@@ -195,7 +221,6 @@ app.get('/getSetaByVersion', async (req, res) => {
 
     updateRequestCount(userId, id, version).catch(err => console.error("Stat update failed", err));
 
-    // UPDATED: Sending 'files' array
     res.status(200).json({
         version: version,
         files: doc.data().files || [],
@@ -220,7 +245,10 @@ app.get('/getSetaInstance', async (req, res) => {
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
+    // STRICT AUTH CHECK
+    if (!checkDatasetAccess(datasetDoc, userId)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
 
     const instanceRef = db.collection('datasets')
         .doc(id)
@@ -237,7 +265,6 @@ app.get('/getSetaInstance', async (req, res) => {
 
     const instanceData = instanceDoc.data();
     
-    // UPDATED: 'files' array matches schema
     res.status(200).json({
         instanceId: instanceId,
         files: instanceData.files || [],
@@ -253,40 +280,36 @@ app.get('/getSetaInstance', async (req, res) => {
 
 /**
  * 4. PROXY Endpoint
+ * Using axios here because fetch in Node requires polyfills or specific versions,
+ * and axios streams are robust for file proxying.
  */
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
+  
   if (!url) return res.status(400).send('URL parameter is required');
 
   try {
     console.log(`Proxying request to: ${url}`);
-    const response = await fetch(url);
     
-    if (!response.ok) {
-      console.error(`Proxy fetch error: ${response.status} ${response.statusText}`);
-      return res.status(response.status).send(`HTTP Error: ${response.status} ${response.statusText}`);
-    }
-
-    const contentType = response.headers.get('content-type') || 'application/octet-stream';
-    const contentLength = response.headers.get('content-length');
-    const contentDisposition = response.headers.get('content-disposition');
+    const response = await axios({
+      method: 'get',
+      url: url,
+      responseType: 'stream'
+    });
     
-    res.setHeader('Content-Type', contentType);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    if (contentDisposition) res.setHeader('Content-Disposition', contentDisposition);
+    if (response.headers['content-type']) res.setHeader('Content-Type', response.headers['content-type']);
+    if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
+    if (response.headers['content-disposition']) res.setHeader('Content-Disposition', response.headers['content-disposition']);
     
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD');
     
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
-    console.log(`Successfully proxied ${buffer.length} bytes`);
-    res.send(buffer);
+    response.data.pipe(res);
 
   } catch (err) {
-    console.error('Proxy fetch error:', err);
-    res.status(500).send('Proxy fetch error: ' + err.message);
+    console.error('Proxy fetch error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).send('Proxy fetch error: ' + err.message);
+    }
   }
 });
 
@@ -299,24 +322,30 @@ app.get('/downloadSetaByVersion', validatePath, async (req, res) => {
   if (!id || !version || !userId || !savePath) return res.status(400).json({ error: 'Missing required parameters' });
 
   try {
-    const datasetDoc = await db.collection("datasets").doc(id).get();
-    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access' });
+    const datasetRef = db.collection("datasets").doc(id);
+    const datasetDoc = await datasetRef.get();
+
+    // STRICT AUTH CHECK
+    if (!checkDatasetAccess(datasetDoc, userId)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
 
     const doc = await db.collection('datasets').doc(id).collection('versions').doc(version).get();
     if (!doc.exists || doc.data().isDisabled) return res.status(404).json({ error: 'Not found or disabled' });
 
-    // UPDATED LOGIC: Handle 'files' array of objects
     const files = doc.data().files;
-    
     let targetUrl = null;
+
     if (files && Array.isArray(files) && files.length > 0) {
-        // Grab the 'fileUrl' from the first object
-        targetUrl = files[0].fileUrl; 
+        targetUrl = files[0].fileUrl; // Defaults to first file
+    } else if (doc.data().fileUrls && doc.data().fileUrls.length > 0) {
+        // Fallback for old schema
+        targetUrl = doc.data().fileUrls[0];
     }
 
     if (!targetUrl) return res.status(404).json({ error: 'No valid file URL found in this version' });
 
-    const fileName = `${id}_${version}_download.zip`;
+    const fileName = `${id}_${version}_download.zip`; 
     const filePath = path.join(savePath, fileName);
     const writer = fs.createWriteStream(filePath);
 
