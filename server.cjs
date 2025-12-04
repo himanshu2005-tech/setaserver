@@ -20,7 +20,8 @@ const serviceAccount = {
   type: process.env.TYPE,
   project_id: process.env.PROJECT_ID,
   private_key_id: process.env.PRIVATE_KEY_ID,
-  private_key: process.env.PRIVATE_KEY.replace(/\\n/g, '\n'),
+  // Handle newline characters for Railway/Heroku env vars
+  private_key: process.env.PRIVATE_KEY ? process.env.PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
   client_email: process.env.CLIENT_EMAIL,
   client_id: process.env.CLIENT_ID,
   auth_uri: process.env.AUTH_URI,
@@ -125,45 +126,32 @@ function checkDatasetAccess(datasetDoc, userId) {
 
 /**
  * 1. Get Recent Seta (Latest Version)
- * UPDATED LOGIC: Sorts by date first, then filters 'isDisabled' in memory
- * to prevent Firestore Index/Ordering errors.
  */
 app.get('/getRecentSeta', async (req, res) => {
   const { id, userId } = req.query;
 
-  if (!id || !userId) {
-    return res.status(400).json({ error: 'Missing id or userId parameter' });
-  }
+  if (!id || !userId) return res.status(400).json({ error: 'Missing id or userId parameter' });
 
   try {
     // 1. Check Root Access
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) {
-      return res.status(403).json({ error: 'No access to this dataset' });
-    }
+    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
 
     // 2. Find Latest Enabled Version
     const versionsRef = datasetRef.collection("versions");
     
-    // Query: Get the 5 most recent versions strictly by time
-    // We do NOT filter by isDisabled here to avoid composite index requirements
     const querySnapshot = await versionsRef
       .orderBy("publishedOn", "desc")
       .limit(5)
       .get();
 
-    if (querySnapshot.empty) {
-      return res.status(404).json({ error: 'No active versions found for this dataset' });
-    }
+    if (querySnapshot.empty) return res.status(404).json({ error: 'No active versions found for this dataset' });
 
-    // Filter in Javascript: Find the first doc where isDisabled is NOT true
     const latestVersionDoc = querySnapshot.docs.find(doc => doc.data().isDisabled !== true);
 
-    if (!latestVersionDoc) {
-      return res.status(404).json({ error: 'No active/enabled versions available' });
-    }
+    if (!latestVersionDoc) return res.status(404).json({ error: 'No active/enabled versions available' });
 
     const latestVersionData = latestVersionDoc.data();
     const versionId = latestVersionDoc.id;
@@ -171,11 +159,11 @@ app.get('/getRecentSeta', async (req, res) => {
     // 3. Update Stats
     updateRequestCount(userId, id, versionId).catch(err => console.error("Stat update failed", err));
 
-    // 4. Return Data
+    // 4. Return Data (UPDATED: Sending 'files' array)
     res.status(200).json({ 
       version: versionId,
       publishedOn: latestVersionData.publishedOn,
-      fileUrls: latestVersionData.fileUrls || [],
+      files: latestVersionData.files || [], 
       metadata: latestVersionData
     });
 
@@ -191,34 +179,26 @@ app.get('/getRecentSeta', async (req, res) => {
 app.get('/getSetaByVersion', async (req, res) => {
   const { id, version, userId } = req.query;
 
-  if (!id || !version || !userId) {
-    return res.status(400).json({ error: 'Missing id, version, or userId parameter' });
-  }
+  if (!id || !version || !userId) return res.status(400).json({ error: 'Missing id, version, or userId parameter' });
 
   try {
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) {
-      return res.status(403).json({ error: 'No access to this dataset' });
-    }
+    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
 
     const docRef = db.collection('datasets').doc(id).collection('versions').doc(version);
     const doc = await docRef.get();
 
-    if (!doc.exists) {
-      return res.status(404).json({ error: 'Version not found' });
-    }
-
-    if (doc.data().isDisabled) {
-        return res.status(403).json({ error: 'This version has been disabled' });
-    }
+    if (!doc.exists) return res.status(404).json({ error: 'Version not found' });
+    if (doc.data().isDisabled) return res.status(403).json({ error: 'This version has been disabled' });
 
     updateRequestCount(userId, id, version).catch(err => console.error("Stat update failed", err));
 
+    // UPDATED: Sending 'files' array
     res.status(200).json({
         version: version,
-        fileUrls: doc.data().fileUrls || [],
+        files: doc.data().files || [],
         metadata: doc.data()
     });
 
@@ -234,17 +214,13 @@ app.get('/getSetaByVersion', async (req, res) => {
 app.get('/getSetaInstance', async (req, res) => {
   const { id, version, instanceId, userId } = req.query;
 
-  if (!id || !version || !instanceId || !userId) {
-    return res.status(400).json({ error: 'Missing id, version, instanceId, or userId' });
-  }
+  if (!id || !version || !instanceId || !userId) return res.status(400).json({ error: 'Missing id, version, instanceId, or userId' });
 
   try {
     const datasetRef = db.collection("datasets").doc(id);
     const datasetDoc = await datasetRef.get();
     
-    if (!checkDatasetAccess(datasetDoc, userId)) {
-      return res.status(403).json({ error: 'No access to this dataset' });
-    }
+    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access to this dataset' });
 
     const instanceRef = db.collection('datasets')
         .doc(id)
@@ -255,14 +231,13 @@ app.get('/getSetaInstance', async (req, res) => {
 
     const instanceDoc = await instanceRef.get();
 
-    if (!instanceDoc.exists) {
-        return res.status(404).json({ error: 'Instance not found' });
-    }
+    if (!instanceDoc.exists) return res.status(404).json({ error: 'Instance not found' });
 
     updateRequestCount(userId, id, version).catch(err => console.error("Stat update failed", err));
 
     const instanceData = instanceDoc.data();
     
+    // UPDATED: 'files' array matches schema
     res.status(200).json({
         instanceId: instanceId,
         files: instanceData.files || [],
@@ -281,14 +256,10 @@ app.get('/getSetaInstance', async (req, res) => {
  */
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
-  
-  if (!url) {
-    return res.status(400).send('URL parameter is required');
-  }
+  if (!url) return res.status(400).send('URL parameter is required');
 
   try {
     console.log(`Proxying request to: ${url}`);
-    
     const response = await fetch(url);
     
     if (!response.ok) {
@@ -325,25 +296,25 @@ app.get('/proxy', async (req, res) => {
 app.get('/downloadSetaByVersion', validatePath, async (req, res) => {
   const { id, version, userId, savePath } = req.query;
 
-  if (!id || !version || !userId || !savePath) {
-    return res.status(400).json({ error: 'Missing required parameters' });
-  }
+  if (!id || !version || !userId || !savePath) return res.status(400).json({ error: 'Missing required parameters' });
 
   try {
     const datasetDoc = await db.collection("datasets").doc(id).get();
-    if (!checkDatasetAccess(datasetDoc, userId)) {
-      return res.status(403).json({ error: 'No access' });
-    }
+    if (!checkDatasetAccess(datasetDoc, userId)) return res.status(403).json({ error: 'No access' });
 
     const doc = await db.collection('datasets').doc(id).collection('versions').doc(version).get();
     if (!doc.exists || doc.data().isDisabled) return res.status(404).json({ error: 'Not found or disabled' });
 
-    // Handle array of files - defaulting to first one
-    const fileUrls = doc.data().fileUrls;
-    if (!fileUrls || fileUrls.length === 0) {
-        return res.status(404).json({ error: 'No files in this version' });
+    // UPDATED LOGIC: Handle 'files' array of objects
+    const files = doc.data().files;
+    
+    let targetUrl = null;
+    if (files && Array.isArray(files) && files.length > 0) {
+        // Grab the 'fileUrl' from the first object
+        targetUrl = files[0].fileUrl; 
     }
-    const targetUrl = Array.isArray(fileUrls) ? fileUrls[0] : fileUrls; 
+
+    if (!targetUrl) return res.status(404).json({ error: 'No valid file URL found in this version' });
 
     const fileName = `${id}_${version}_download.zip`;
     const filePath = path.join(savePath, fileName);
